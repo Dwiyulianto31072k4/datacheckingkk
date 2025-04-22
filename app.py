@@ -1,566 +1,172 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import openpyxl
-import zipfile
-import re
 from datetime import datetime
-import time
 import io
 import base64
-import altair as alt
 import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
-# Tambahkan error handling global
-try:
-    st.set_page_config(
-        page_title="KK & NIK Data Validation Tool",
-        page_icon="📋",
-        layout="wide"
+# --- Page Config ---
+st.set_page_config(
+    page_title="KK & NIK Validation Dashboard",
+    page_icon="📋",
+    layout="wide"
+)
+
+# --- Custom CSS for UI Enhancement ---
+st.markdown(
+    """
+    <style>
+    /* Hide Streamlit footer and menu */
+    footer {visibility: hidden;} 
+    #MainMenu {visibility: hidden;}
+    /* Centered title style */
+    .title {text-align: center; color: #2E86AB; font-size: 2.5rem;}
+    /* Card metrics style */
+    .metric-container {background-color: #F0F4F8; border-radius: 10px; padding: 1rem; margin-bottom: 1rem;}
+    </style>
+    """, unsafe_allow_html=True
+)
+
+# --- Helper Functions ---
+def clean_data(df: pd.DataFrame, kota_list: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    df = df.copy()
+    df['Check_Desc'] = ''
+    # validators: (column, func, message)
+    validators = [
+        ('KK_NO', lambda x: isinstance(x, str) and x.isdigit() and len(x) == 16 and not x.endswith('0000'), 'Invalid KK_NO'),
+        ('NIK', lambda x: isinstance(x, str) and x.isdigit() and len(x) == 16 and not x.endswith('0000'), 'Invalid NIK'),
+        ('CUSTNAME', lambda x: isinstance(x, str) and not any(ch.isdigit() for ch in x), 'Invalid Name'),
+        ('JENIS_KELAMIN', lambda x: str(x).upper().strip() in {'LAKI-LAKI','LAKI LAKI','PEREMPUAN'}, 'Invalid Gender'),
+        ('TEMPAT_LAHIR', lambda x: isinstance(x, str) and x.upper().strip() in kota_list, 'Invalid Place'),
+        ('TANGGAL_LAHIR', lambda x: _is_valid_date(x), 'Invalid Birth Date'),
+    ]
+    for col, fn, msg in validators:
+        valid = df[col].apply(fn)
+        df.loc[~valid, 'Check_Desc'] += df.loc[~valid, col].astype(str).apply(lambda v: f"{msg} ({v}); ")
+    mask = df['Check_Desc'] != ''
+    return df[mask], df[~mask].drop(columns=['Check_Desc'])
+
+
+def _is_valid_date(x) -> bool:
+    if pd.isna(x):
+        return False
+    if isinstance(x, pd.Timestamp):
+        dt = x
+    else:
+        try:
+            dt = datetime.strptime(str(x), '%d/%m/%Y')
+        except ValueError:
+            return False
+    return dt.date() <= datetime.today().date()
+
+
+def generate_excel(messy: pd.DataFrame, clean: pd.DataFrame, total: int) -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        pd.DataFrame({'Metric': ['Total','Clean','Messy'], 'Count': [total, len(clean), len(messy)]}) \
+            .to_excel(writer, sheet_name='Summary', index=False)
+        clean.to_excel(writer, sheet_name='Clean', index=False)
+        messy.to_excel(writer, sheet_name='Messy', index=False)
+    return buffer.getvalue()
+
+# --- Sidebar ---
+st.sidebar.title("📋 KK & NIK Validator")
+uploaded_excel = st.sidebar.file_uploader("Upload Excel (.xlsx)", type=['xlsx'])
+uploaded_city = st.sidebar.file_uploader("Upload City List (.csv)", type=['csv','txt'])
+
+# --- Main ---
+st.markdown("<div class='title'>KK & NIK Data Validation Dashboard</div>", unsafe_allow_html=True)
+
+if uploaded_excel and uploaded_city:
+    # Load city list
+    city_df = pd.read_csv(uploaded_city)
+    if 'CITY_DESC' in city_df.columns:
+        kota_list = city_df['CITY_DESC'].str.upper().str.strip().tolist()
+    else:
+        kota_list = city_df.iloc[:,0].astype(str).str.upper().str.strip().tolist()
+
+    # Read all sheets
+    try:
+        xls = pd.ExcelFile(uploaded_excel)
+        df_full = pd.concat([pd.read_excel(xls, sheet_name=sh, dtype=str) for sh in xls.sheet_names], ignore_index=True)
+    except Exception as e:
+        st.error(f"Error loading Excel file: {e}")
+        st.stop()
+
+    # Ensure columns
+    req_cols = ['KK_NO','NIK','CUSTNAME','JENIS_KELAMIN','TANGGAL_LAHIR','TEMPAT_LAHIR']
+    missing = [c for c in req_cols if c not in df_full.columns]
+    if missing:
+        st.error(f"Missing columns: {', '.join(missing)}")
+        st.stop()
+
+    df_req = df_full[req_cols].copy()
+    # Normalize date strings
+    df_req['TANGGAL_LAHIR'] = pd.to_datetime(df_req['TANGGAL_LAHIR'], format='%d/%m/%Y', errors='coerce') \
+        .dt.strftime('%d/%m/%Y')
+
+    # Split clean & messy
+    messy_df, clean_df = clean_data(df_req, kota_list)
+    total = len(df_req)
+    clean_cnt, messy_cnt = len(clean_df), len(messy_df)
+    invalid_counts = {
+        'KK_NO': messy_df['Check_Desc'].str.contains('Invalid KK_NO').sum(),
+        'NIK': messy_df['Check_Desc'].str.contains('Invalid NIK').sum(),
+        'Name': messy_df['Check_Desc'].str.contains('Invalid Name').sum(),
+        'Gender': messy_df['Check_Desc'].str.contains('Invalid Gender').sum(),
+        'Place': messy_df['Check_Desc'].str.contains('Invalid Place').sum(),
+        'Birth Date': messy_df['Check_Desc'].str.contains('Invalid Birth Date').sum(),
+    }
+
+    # --- Dashboard ---
+    st.subheader("Overview Metrics")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("<div class='metric-container'>", unsafe_allow_html=True)
+        st.metric("Total Records", f"{total:,}")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with c2:
+        st.markdown("<div class='metric-container'>", unsafe_allow_html=True)
+        st.metric("Clean Records", f"{clean_cnt:,}", f"{clean_cnt/total*100:.1f}%")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with c3:
+        st.markdown("<div class='metric-container'>", unsafe_allow_html=True)
+        st.metric("Messy Records", f"{messy_cnt:,}", f"{messy_cnt/total*100:.1f}%")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # Invalid breakdown chart
+    inv_df = pd.DataFrame({'Category': list(invalid_counts.keys()), 'Count': list(invalid_counts.values())})
+    fig = px.bar(inv_df, x='Category', y='Count', text='Count', color='Category')
+    fig.update_layout(showlegend=False, margin=dict(t=30, b=20, l=0, r=0))
+    st.subheader("Invalid Data Breakdown")
+    st.plotly_chart(fig, use_container_width=True)
+    with st.expander("Lihat Detail Breakdown"):
+        st.table(inv_df.style.format({'Count':'{:,}'}))
+
+    # Samples and download
+    st.subheader("Data Samples & Unduhan")
+    tab1, tab2 = st.tabs(["Clean Sample","Messy Sample"])
+    with tab1:
+        st.dataframe(clean_df.head(10))
+    with tab2:
+        st.dataframe(messy_df.head(10))
+
+    report = generate_excel(messy_df, clean_df, total)
+    st.download_button(
+        "📥 Download Full Report",
+        data=report,
+        file_name="validation_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    st.title("KK & NIK Data Validation Tool")
-
-    # Define helper functions - EXACT SAME LOGIC AS THE NOTEBOOK
-    def clean_data(raw_df, kota_indonesia):
-        # Define criteria for clean data
-        def is_valid_kk_no(kk_no):
-            if not isinstance(kk_no, str):
-                return False
-            if not kk_no.isdigit():
-                return False
-            if len(kk_no) != 16:
-                return False
-            if len(kk_no) >= 4 and kk_no[-4:] == '0000':
-                return False
-            return True
-
-        def is_valid_nik(nik):
-            if not isinstance(nik, str):
-                return False
-            if not nik.isdigit():
-                return False
-            if len(nik) != 16:
-                return False
-            if len(nik) >= 4 and nik[-4:] == '0000':
-                return False
-            return True
-
-        def is_valid_custname(custname):
-            # return isinstance(custname, str) and bool(re.match("^[A-Za-z ]*$", custname))
-            return isinstance(custname, str) and not any(c.isdigit() for c in custname)
-
-        def is_valid_jenis_kelamin(jenis_kelamin):
-            if not isinstance(jenis_kelamin, str):
-                return False
-            return jenis_kelamin in ['LAKI-LAKI','LAKI - LAKI','LAKI LAKI', 'PEREMPUAN']
-
-        def is_valid_tempat_lahir(tempat_lahir):
-            if not isinstance(tempat_lahir, str):
-                return False
-            return tempat_lahir.upper() in kota_indonesia
-            # return tempat_lahir in kota_indonesia
-
-        def is_valid_date(date_str):
-            if isinstance(date_str, str):
-                try:
-                    date_obj = datetime.strptime(date_str, '%d/%m/%Y')
-                    if date_obj.date() <= datetime.today().date():
-                        return True
-                    else:
-                        return False
-                except ValueError:
-                    return False
-            elif isinstance(date_str, pd.Timestamp):
-                if date_str.date() <= datetime.today().date():
-                    return True
-                else:
-                    return False
-            else:
-                return False
-
-        # Initialize the Check_Desc column with empty strings
-        raw_df['Check_Desc'] = ''
-
-        # Apply criteria to filter clean data
-        valid_kk_no = raw_df['KK_NO'].apply(is_valid_kk_no)
-        valid_nik = raw_df['NIK'].apply(is_valid_nik)
-        valid_custname = raw_df['CUSTNAME'].apply(is_valid_custname)
-        valid_jenis_kelamin = raw_df['JENIS_KELAMIN'].apply(is_valid_jenis_kelamin)
-        valid_tempat_lahir = raw_df['TEMPAT_LAHIR'].apply(is_valid_tempat_lahir)
-        valid_tanggal_lahir = raw_df['TANGGAL_LAHIR'].apply(is_valid_date)
-
-        clean_df = raw_df[valid_kk_no & valid_nik & valid_custname & valid_jenis_kelamin & valid_tempat_lahir & valid_tanggal_lahir]
-
-        # Identify issues in the data - dengan perbaikan error handling
-        def safe_check_kk(x):
-            try:
-                if not isinstance(x, str):
-                    return f'Invalid KK_NO (not a string); '
-                return f'Invalid KK_NO (length: {len(str(x))}, digits only: {str(x).isdigit()}, last_digits: {str(x)[-4:] if len(str(x)) >= 4 else "too short"}); '
-            except Exception as e:
-                return f'Invalid KK_NO (error: {str(e)}); '
-        
-        def safe_check_nik(x):
-            try:
-                if not isinstance(x, str):
-                    return f'Invalid NIK (not a string); '
-                return f'Invalid NIK (length: {len(str(x))}, digits only: {str(x).isdigit()}, last_digits: {str(x)[-4:] if len(str(x)) >= 4 else "too short"}); '
-            except Exception as e:
-                return f'Invalid NIK (error: {str(e)}); '
-        
-        def safe_check_custname(x):
-            try:
-                return f'Invalid CUSTNAME (contains special characters or digits: {x}); '
-            except Exception as e:
-                return f'Invalid CUSTNAME (error: {str(e)}); '
-        
-        def safe_check_jenis_kelamin(x):
-            try:
-                return f'Invalid JENIS_KELAMIN (value: {x}); '
-            except Exception as e:
-                return f'Invalid JENIS_KELAMIN (error: {str(e)}); '
-        
-        def safe_check_tempat_lahir(x):
-            try:
-                return f'Invalid TEMPAT_LAHIR (value: {str(x)}); '
-            except Exception as e:
-                return f'Invalid TEMPAT_LAHIR (error: {str(e)}); '
-        
-        def safe_check_tanggal_lahir(x):
-            try:
-                return f'Invalid TANGGAL_LAHIR (value: {str(x)}, expected format DD/MM/YYYY); '
-            except Exception as e:
-                return f'Invalid TANGGAL_LAHIR (error: {str(e)}); '
-        
-        raw_df.loc[~valid_kk_no, 'Check_Desc'] += raw_df.loc[~valid_kk_no, 'KK_NO'].apply(safe_check_kk)
-        raw_df.loc[~valid_nik, 'Check_Desc'] += raw_df.loc[~valid_nik, 'NIK'].apply(safe_check_nik)
-        raw_df.loc[~valid_custname, 'Check_Desc'] += raw_df.loc[~valid_custname, 'CUSTNAME'].apply(safe_check_custname)
-        raw_df.loc[~valid_jenis_kelamin, 'Check_Desc'] += raw_df.loc[~valid_jenis_kelamin, 'JENIS_KELAMIN'].apply(safe_check_jenis_kelamin)
-        raw_df.loc[~valid_tempat_lahir, 'Check_Desc'] += raw_df.loc[~valid_tempat_lahir, 'TEMPAT_LAHIR'].apply(safe_check_tempat_lahir)
-        raw_df.loc[~valid_tanggal_lahir, 'Check_Desc'] += raw_df.loc[~valid_tanggal_lahir, 'TANGGAL_LAHIR'].apply(safe_check_tanggal_lahir)
-        
-        # All other rows are considered messy data
-        messy_df = raw_df[raw_df['Check_Desc'] != '']
-
-        # Remove the Check_Desc column from the clean_df
-        clean_df = clean_df.drop(columns=['Check_Desc'])
-
-        return messy_df, clean_df
-
-    def generate_summary_excel(messy_df, clean_df, total_data):
-        """Generate Excel with summary and both datasets"""
-        output = io.BytesIO()
-        
-        # Calculate statistics EXACTLY as in notebook
-        messy_data = len(messy_df)
-        clean_data = len(clean_df)
-        
-        num_rows, num_cols = messy_df.shape
-        len_param = num_cols - 1
-        
-        invalid_kk = len(messy_df[messy_df['Check_Desc'].str.contains('Invalid KK_NO')])
-        invalid_nik = len(messy_df[messy_df['Check_Desc'].str.contains('Invalid NIK')])
-        invalid_name = len(messy_df[messy_df['Check_Desc'].str.contains('Invalid CUSTNAME')])
-        invalid_gender = len(messy_df[messy_df['Check_Desc'].str.contains('Invalid JENIS_KELAMIN')])
-        invalid_places = len(messy_df[messy_df['Check_Desc'].str.contains('Invalid TEMPAT_LAHIR')])
-        invalid_date = len(messy_df[messy_df['Check_Desc'].str.contains('Invalid TANGGAL_LAHIR')])
-        
-        total_invalid = len(messy_df) * len_param
-        messy_invalid = invalid_kk + invalid_nik + invalid_name + invalid_gender + invalid_places + invalid_date
-        clean_invalid = total_invalid - messy_invalid
-        
-        # Prepare summary data
-        summary_headers = ["Category", "Total Data", "Messy Data", "Clean Data", "", "Invalid Parameter", "Clean Parameter", "Messy Parameter", "Invalid KK", "Invalid NIK", "Invalid Name", "Invalid Gender", "Invalid Places", "Invalid Date"]
-        summary_counts = ["Data", total_data, messy_data, clean_data, "", total_invalid, clean_invalid, messy_invalid, invalid_kk, invalid_nik, invalid_name, invalid_gender, invalid_places, invalid_date]
-        summary_percentages = ["Data (%)", 100.0, round(messy_data / total_data * 100, 2), round(clean_data / total_data * 100, 2), "", 100.0, round(clean_invalid / total_invalid * 100, 2), round(messy_invalid / total_invalid * 100, 2), round(invalid_kk / total_invalid * 100, 2), round(invalid_nik / total_invalid * 100, 2), round(invalid_name / total_invalid * 100, 2), round(invalid_gender / total_invalid * 100, 2), round(invalid_places / total_invalid * 100, 2), round(invalid_date / total_invalid * 100, 2)]
-        
-        summary_df = pd.DataFrame([summary_counts, summary_percentages], columns=summary_headers)
-        
-        # Create Excel file with multiple sheets
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            summary_df.to_excel(writer, sheet_name='Summary', index=False)
-            messy_df.to_excel(writer, sheet_name='Messy Data', index=False)
-            clean_df.to_excel(writer, sheet_name='Clean Data', index=False)
-        
-        return output.getvalue()
-
-    # Function to create executive dashboard
-    def create_executive_dashboard(total_data, clean_data, messy_data, invalid_kk, invalid_nik, invalid_name, 
-                                invalid_gender, invalid_places, invalid_date, total_invalid):
-        # Create two columns for the top metrics
-        col1, col2, col3 = st.columns(3)
-        
-        # Display metrics in each column
-        with col1:
-            st.metric("Total Records", f"{total_data:,}")
-        
-        with col2:
-            st.metric("Clean Records", f"{clean_data:,}", f"{round(clean_data/total_data*100, 1)}%")
-        
-        with col3:
-            st.metric("Messy Records", f"{messy_data:,}", f"{round(messy_data/total_data*100, 1)}%")
-        
-        # Create two columns for charts
-        chart_col1, chart_col2 = st.columns(2)
-        
-        with chart_col1:
-            st.subheader("Data Quality Overview")
-            
-            # Create pie chart for clean vs messy data
-            pie_data = pd.DataFrame({
-                'Category': ['Clean Data', 'Messy Data'],
-                'Value': [clean_data, messy_data]
-            })
-            
-            fig = px.pie(
-                pie_data, 
-                values='Value', 
-                names='Category',
-                color='Category',
-                color_discrete_map={
-                    'Clean Data': '#4CAF50',
-                    'Messy Data': '#F44336'
-                },
-                hole=0.4
-            )
-            fig.update_layout(
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with chart_col2:
-            st.subheader("Invalid Data Breakdown")
-            
-            # Create data for the invalid breakdown
-            invalid_data = pd.DataFrame({
-                'Category': ['KK Number', 'NIK', 'Name', 'Gender', 'Birth Place', 'Birth Date'],
-                'Count': [invalid_kk, invalid_nik, invalid_name, invalid_gender, invalid_places, invalid_date],
-                'Percentage': [
-                    round(invalid_kk/total_invalid*100, 2),
-                    round(invalid_nik/total_invalid*100, 2),
-                    round(invalid_name/total_invalid*100, 2),
-                    round(invalid_gender/total_invalid*100, 2),
-                    round(invalid_places/total_invalid*100, 2),
-                    round(invalid_date/total_invalid*100, 2)
-                ]
-            })
-            
-            # Sort by count descending
-            invalid_data = invalid_data.sort_values('Count', ascending=False)
-            
-            # Hindari division by zero
-            if total_invalid > 0:
-                fig = px.bar(
-                    invalid_data,
-                    y='Category',
-                    x='Count',
-                    text='Percentage',
-                    orientation='h',
-                    labels={'Count': 'Number of Invalid Records', 'Category': 'Field'},
-                    color='Count',
-                    color_continuous_scale=px.colors.sequential.Reds
-                )
-                fig.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
-                fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
-                
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No invalid data to display")
-        
-        # Executive Summary section
-        st.subheader("Executive Summary")
-        
-        # Find the most problematic field only if invalid_data is not empty
-        if not invalid_data.empty and len(invalid_data) > 0:
-            most_problematic = invalid_data.iloc[0]['Category']
-            
-            # Create columns for the summary cards
-            sum_col1, sum_col2 = st.columns(2)
-            
-            with sum_col1:
-                st.info(f"""
-                #### Quality Metrics
-                - Data quality rate: **{round(clean_data/total_data*100, 1)}%**
-                - Total records processed: **{total_data:,}**
-                - Clean records: **{clean_data:,}**
-                - Records with issues: **{messy_data:,}**
-                """)
-            
-            with sum_col2:
-                st.warning(f"""
-                #### Key Findings
-                - Most common data issue: **{most_problematic}**
-                - Number of {most_problematic} issues: **{invalid_data.iloc[0]['Count']:,}**
-                - Percentage of total issues: **{invalid_data.iloc[0]['Percentage']}%**
-                - Recommendation: Focus on improving data quality for {most_problematic} validation
-                """)
-        else:
-            st.info(f"""
-            #### Quality Metrics
-            - Data quality rate: **{round(clean_data/total_data*100, 1)}%**
-            - Total records processed: **{total_data:,}**
-            - Clean records: **{clean_data:,}**
-            - Records with issues: **{messy_data:,}**
-            """)
-
-    # Sidebar with information and upload
-    with st.sidebar:
-        st.header("Upload Data")
-        uploaded_excel = st.file_uploader("Upload your Excel file", type=['xlsx'])
-        
-        st.markdown("---")
-        st.header("Upload City List (Required)")
-        uploaded_city_list = st.file_uploader("Upload a city list (CSV/TXT)", type=['csv', 'txt'])
-        
-        st.markdown("---")
-        st.subheader("About This Tool")
-        st.info("""
-        This tool validates Indonesian ID Card (NIK) and Family Card (KK) data.
-        
-        Validation Rules:
-        - KK_NO: 16 digits, not ending with '0000'
-        - NIK: 16 digits, not ending with '0000'
-        - Names: No digits allowed
-        - Gender: Standard formats (LAKI-LAKI, LAKI - LAKI, LAKI LAKI, PEREMPUAN)
-        - Birth place: Against city database
-        - Birth date: Valid format and not future date
-        """)
-
-    # Main page content
-    if uploaded_excel is not None and uploaded_city_list is not None:
-        start_time = time.time()
-        
-        # Process city list
-        kota_indonesia = []
-        try:
-            city_df = pd.read_csv(uploaded_city_list, delimiter=',')
-            if 'CITY_DESC' in city_df.columns:
-                # Process same as original code
-                city_df['CITY_DESC'] = city_df['CITY_DESC'].str.replace('Kota ', '').str.replace('Kabupaten ', '').str.replace('Kab ', '')
-                city_df['CITY_DESC'] = city_df['CITY_DESC'].str.upper()
-                kota_indonesia = city_df['CITY_DESC'].tolist()
-            else:
-                # Assume simple list format
-                kota_indonesia = [city.strip().upper() for city in city_df.iloc[:, 0].tolist()]
-                
-            st.sidebar.success(f"Loaded {len(kota_indonesia)} cities from uploaded list")
-
-            # Optional: Allow adding custom cities as shown in notebook
-            new_kota_option = st.sidebar.checkbox("Add default city list (from notebook)")
-            if new_kota_option:
-                new_kota = [
-                    'ACEH BARAT', 'ACEH BESAR', 'ACEH TAMIANG', 'ACEH TIMUR', 'ACEH',
-                    # You can include more cities from the notebook here
-                    'JAKARTA', 'BANDUNG', 'SURABAYA', 'MEDAN', 'MAKASSAR'
-                ]
-                kota_indonesia.extend(new_kota)
-                st.sidebar.info(f"Added {len(new_kota)} cities from default list")
-                
-        except Exception as e:
-            st.sidebar.error(f"Error reading city list: {e}")
-            st.stop()
-        
-        # Process the Excel file - EXACTLY AS IN NOTEBOOK but with better error handling
-        try:
-            with st.spinner("Loading and processing data..."):
-                # Read Excel file
-                df_full = pd.DataFrame()
-                excel_file = uploaded_excel
-                
-                # Read Excel workbook
-                try:
-                    workbook = openpyxl.load_workbook(excel_file)
-                    sheet_names = workbook.sheetnames
-                    
-                    for sheet in sheet_names:
-                        try:
-                            df = pd.read_excel(excel_file, sheet_name=sheet, dtype={'KK_NO_GROSS':object, 'KK_NO':object, 'NIK_GROSS':object, 'NIK':object})
-                            df_full = pd.concat([df_full, df], ignore_index=True)
-                        except Exception as e:
-                            st.warning(f"Error reading sheet {sheet}: {e}")
-                except Exception as e:
-                    st.error(f"Error opening Excel file: {e}")
-                    st.stop()
-                
-                # Check if we have data
-                if df_full.empty:
-                    st.error("No data could be read from the Excel file.")
-                    st.stop()
-                
-                # Check for required columns
-                required_columns = ['KK_NO', 'NIK', 'CUSTNAME', 'JENIS_KELAMIN', 'TANGGAL_LAHIR', 'TEMPAT_LAHIR']
-                missing_columns = [col for col in required_columns if col not in df_full.columns]
-                
-                if missing_columns:
-                    st.error(f"Excel file is missing required columns: {', '.join(missing_columns)}")
-                    st.stop()
-                
-                # Prepare data for validation - EXACTLY as in notebook but with more error handling
-                df_req = df_full.loc[:, required_columns].copy()
-                df_req['KK_NO'] = df_req['KK_NO'].astype(str)  # Gunakan astype string untuk menghindari error
-                df_req['NIK'] = df_req['NIK'].astype(str)
-                
-                # Try to convert dates - handle different formats
-                try:
-                    df_req['TANGGAL_LAHIR'] = pd.to_datetime(df_req['TANGGAL_LAHIR'], format="%d/%m/%Y", errors='coerce')
-                except:
-                    try:
-                        df_req['TANGGAL_LAHIR'] = pd.to_datetime(df_req['TANGGAL_LAHIR'], errors='coerce')
-                    except:
-                        st.warning("Could not parse date format. Treating as string.")
-                
-                # Konversi tempat lahir ke string untuk menghindari error
-                df_req['TEMPAT_LAHIR'] = df_req['TEMPAT_LAHIR'].astype(str)
-                
-                # Run the validation
-                messy_df, clean_df = clean_data(df_req, kota_indonesia)
-                
-                end_time = time.time()
-                processing_time = end_time - start_time
-                
-                # Calculate statistics EXACTLY as in notebook
-                total_data = len(df_req)
-                messy_data = len(messy_df)
-                clean_data = len(clean_df)
-                
-                num_rows, num_cols = messy_df.shape
-                len_param = num_cols - 1
-                
-                # Pastikan tidak ada error saat menghitung statistik
-                try:
-                    invalid_kk = len(messy_df[messy_df['Check_Desc'].str.contains('Invalid KK_NO')])
-                    invalid_nik = len(messy_df[messy_df['Check_Desc'].str.contains('Invalid NIK')])
-                    invalid_name = len(messy_df[messy_df['Check_Desc'].str.contains('Invalid CUSTNAME')])
-                    invalid_gender = len(messy_df[messy_df['Check_Desc'].str.contains('Invalid JENIS_KELAMIN')])
-                    invalid_places = len(messy_df[messy_df['Check_Desc'].str.contains('Invalid TEMPAT_LAHIR')])
-                    invalid_date = len(messy_df[messy_df['Check_Desc'].str.contains('Invalid TANGGAL_LAHIR')])
-                except Exception as e:
-                    st.error(f"Error calculating statistics: {e}")
-                    # Set default values jika terjadi error
-                    invalid_kk = invalid_nik = invalid_name = invalid_gender = invalid_places = invalid_date = 0
-                
-                # Hindari division by zero
-                if len(messy_df) > 0:
-                    total_invalid = len(messy_df) * len_param
-                    messy_invalid = invalid_kk + invalid_nik + invalid_name + invalid_gender + invalid_places + invalid_date
-                    clean_invalid = total_invalid - messy_invalid
-                else:
-                    total_invalid = messy_invalid = clean_invalid = 0
-                
-                # Display success message
-                st.success(f"Processing complete in {processing_time:.2f} seconds")
-                
-                # Create tab-based interface
-                tab1, tab2 = st.tabs(["Executive Dashboard", "Detailed Summary"])
-                
-                with tab1:
-                    # Call the executive dashboard function
-                    create_executive_dashboard(
-                        total_data, clean_data, messy_data,
-                        invalid_kk, invalid_nik, invalid_name,
-                        invalid_gender, invalid_places, invalid_date,
-                        total_invalid
-                    )
-                
-                with tab2:
-                    # Show the original text output with safety checks for division by zero
-                    clean_data_pct = round(clean_data/total_data*100, 2) if total_data > 0 else 0
-                    messy_data_pct = round(messy_data/total_data*100, 2) if total_data > 0 else 0
-                    
-                    clean_param_pct = round(clean_invalid/total_invalid*100, 2) if total_invalid > 0 else 0
-                    messy_param_pct = round(messy_invalid/total_invalid*100, 2) if total_invalid > 0 else 0
-                    
-                    invalid_kk_pct = round(invalid_kk/total_invalid*100, 2) if total_invalid > 0 else 0
-                    invalid_nik_pct = round(invalid_nik/total_invalid*100, 2) if total_invalid > 0 else 0
-                    invalid_name_pct = round(invalid_name/total_invalid*100, 2) if total_invalid > 0 else 0
-                    invalid_gender_pct = round(invalid_gender/total_invalid*100, 2) if total_invalid > 0 else 0
-                    invalid_places_pct = round(invalid_places/total_invalid*100, 2) if total_invalid > 0 else 0
-                    invalid_date_pct = round(invalid_date/total_invalid*100, 2) if total_invalid > 0 else 0
-                    
-                    output_text = f"""------------------------------
-        SUMMARY INFO
-------------------------------
-Total Data: {total_data}
-Total Data %: 100.0
-Messy Data: {messy_data}
-Messy Data %: {messy_data_pct}
-Clean Data: {clean_data}
-Clean Data %: {clean_data_pct}
-------------------------------
-        INVALID INFO
-------------------------------
-Invalid Parameter: {total_invalid}
-Invalid Parameter %: 100.0
-Clean Parameter: {clean_invalid}
-Clean Parameter %: {clean_param_pct}
-Messy Parameter: {messy_invalid}
-Messy Parameter %: {messy_param_pct}
-Invalid KK: {invalid_kk}
-Invalid KK %: {invalid_kk_pct}
-Invalid NIK: {invalid_nik}
-Invalid NIK %: {invalid_nik_pct}
-Invalid Name: {invalid_name}
-Invalid Name %: {invalid_name_pct}
-Invalid Gender: {invalid_gender}
-Invalid Gender %: {invalid_gender_pct}
-Invalid Places: {invalid_places}
-Invalid Places %: {invalid_places_pct}
-Invalid Date: {invalid_date}
-Invalid Date %: {invalid_date_pct}
-------------------------------
-"""
-                    # Use pre-formatted text block to maintain exact spacing
-                    st.text(output_text)
-                    
-                    # Display sample data
-                    st.subheader("Sample of Clean Data")
-                    st.dataframe(clean_df.head(5) if not clean_df.empty else "No clean data found")
-                    
-                    st.subheader("Sample of Messy Data")
-                    st.dataframe(messy_df.head(5) if not messy_df.empty else "No messy data found")
-                
-                # Download button
-                st.header("Download Results")
-                excel_data = generate_summary_excel(messy_df, clean_df, total_data)
-                
-                st.download_button(
-                    label="Download Full Report (Excel)",
-                    data=excel_data,
-                    file_name="data_validation_results.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                    
-        except Exception as e:
-            st.error(f"An error occurred during processing: {str(e)}")
-            import traceback
-            st.code(traceback.format_exc())
-    elif uploaded_excel is not None and uploaded_city_list is None:
-        st.warning("Please upload a city list file to continue.")
-    elif uploaded_excel is None and uploaded_city_list is not None:
-        st.warning("Please upload an Excel file to continue.")
-    else:
-        # Display instructions when no file is uploaded
-        st.info("Please upload an Excel file and a city list file to begin validation.")
-        st.markdown("""
-        ### Required Excel Column Headers
-        Your Excel file should contain these columns:
-        - `KK_NO` (Family Card Number)
-        - `NIK` (National ID Number)
-        - `CUSTNAME` (Person's Name)
-        - `JENIS_KELAMIN` (Gender)
-        - `TANGGAL_LAHIR` (Date of Birth)
-        - `TEMPAT_LAHIR` (Place of Birth)
-        
-        ### City List Format
-        Your city list file should be a CSV with either:
-        - A column named 'CITY_DESC' containing city names
-        - Or a simple list of city names in the first column
-        """)
-
-except Exception as e:
-    st.error(f"Application error: {str(e)}")
-    import traceback
-    st.code(traceback.format_exc())
+else:
+    st.warning("Silakan upload file Excel dan City List di sidebar untuk memulai.")
+    st.markdown(
+        "- **KK_NO**: 16 digit, tidak berakhiran '0000'<br>"
+        "- **NIK**: 16 digit, tidak berakhiran '0000'<br>"
+        "- **Nama**: tanpa angka<br>"
+        "- **Jenis Kelamin**: LAKI-LAKI / PEREMPUAN<br>"
+        "- **Tanggal Lahir**: DD/MM/YYYY, tidak di masa depan<br>"
+        "- **Tempat Lahir**: sesuai daftar kota", unsafe_allow_html=True
+    )
